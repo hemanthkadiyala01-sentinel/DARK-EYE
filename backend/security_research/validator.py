@@ -98,6 +98,9 @@ class FindingValidator:
 
     def extract_context(self, context: Union[Dict[str, Any], Any]) -> Dict[str, Any]:
         """Normalize target context and headers from diverse context dictionaries."""
+        if hasattr(context, "to_dict"):
+            context = context.to_dict()
+
         if not isinstance(context, dict):
             return {"target": "", "scheme": "", "headers": {}, "http": {}}
 

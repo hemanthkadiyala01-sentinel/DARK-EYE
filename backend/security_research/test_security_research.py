@@ -1,10 +1,21 @@
 from dataclasses import asdict
+from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
+import hashlib
+
 from backend.security_research.agent import (
     ScopeManager,
     SecurityResearchAgent,
     Finding,
     save_report,
+    AuthorizationStatus,
+    PermissionGrant,
+    ProgramMetadata,
+    Endpoint,
+    EndpointInventory,
+    EvidenceBundle,
+    AuditEvent,
+    AuditTrail,
 )
 from backend.security_research.validator import (
     FindingValidator,
@@ -13,6 +24,10 @@ from backend.security_research.validator import (
     ValidationResult,
 )
 
+
+# ==============================================================================
+# Scope Tests (M7.5 / M7.7)
+# ==============================================================================
 
 def test_scope_exact_domain():
     manager = ScopeManager(["example.com"])
@@ -31,6 +46,25 @@ def test_scope_blocks_non_http():
     manager = ScopeManager(["example.com"])
 
     assert not manager.is_allowed("ftp://example.com/file")
+
+
+def test_scope_with_program_metadata_and_path_exclusions():
+    """ProgramMetadata path exclusions (e.g. /admin, /logout) must block out-of-scope paths."""
+    program = ProgramMetadata(
+        program_id="sec-eng-01",
+        name="Security Lab Engagement",
+        allowed_domains=["target.local"],
+        excluded_paths=["/admin", "/logout", "/private/"],
+    )
+    manager = ScopeManager(program=program)
+
+    assert manager.is_allowed("https://target.local/api/users")
+    assert manager.is_allowed("https://target.local/dashboard")
+    assert not manager.is_allowed("https://target.local/admin")
+    assert not manager.is_allowed("https://target.local/admin/settings")
+    assert not manager.is_allowed("https://target.local/logout")
+    assert not manager.is_allowed("https://target.local/private/keys")
+    assert not manager.is_allowed("https://other.local/api")
 
 
 # ==============================================================================
@@ -259,7 +293,6 @@ def test_confidence_calculation():
 
 def test_preservation_of_m75_behavior(tmp_path):
     """Verify backwards compatibility of Finding dataclass and save_report output."""
-    # Finding initialized with 5 positional arguments (M7.5 style)
     legacy_finding = Finding(
         title="Missing Permissions-Policy",
         severity="low",
@@ -275,7 +308,6 @@ def test_preservation_of_m75_behavior(tmp_path):
     assert legacy_finding.final_confidence == 85
     assert legacy_finding.validation is None
 
-    # Report saving functionality preserves format and incorporates validation details
     agent = SecurityResearchAgent(
         target="https://example.com",
         allowed_domains=["example.com"],
@@ -310,10 +342,16 @@ def test_preservation_of_m75_behavior(tmp_path):
 
 
 def test_agent_run_integration():
-    """Test full SecurityResearchAgent.run() flow with mock HTTP response."""
+    """Test full SecurityResearchAgent.run() flow with mock HTTP response and explicit authorization."""
+    permission = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead Security Auditor",
+        scope_reference="ENGAGEMENT-2026-001",
+    )
     agent = SecurityResearchAgent(
         target="http://example.com",
         allowed_domains=["example.com"],
+        permission=permission,
     )
 
     mock_response = MagicMock()
@@ -323,13 +361,13 @@ def test_agent_run_integration():
         "Server": "nginx/1.19",
         "Content-Type": "text/html",
     }
-    mock_response.read.return_value = b"<html><head><title>Test</title></head><body><form action='/login'></form></body></html>"
+    body_content = b"<html><head><title>Test</title></head><body><form action='/login' method='post'></form></body></html>"
+    mock_response.read.return_value = body_content
 
     mock_cm = MagicMock()
     mock_cm.__enter__.return_value = mock_response
     with patch("urllib.request.urlopen", return_value=mock_cm):
         result = agent.run()
-
 
     assert "evidence" in result
     assert "findings" in result
@@ -359,3 +397,252 @@ def test_agent_run_integration():
     assert server_finding["validation"]["status"] == "VALIDATED"
     assert server_finding["final_confidence"] == 100
 
+    # M7.7 Evidence verification
+    evidence = result["evidence"]
+    assert evidence["authorization_verified"] is True
+    assert evidence["scope_verified"] is True
+    assert evidence["sha256_digest"] == hashlib.sha256(body_content).hexdigest()
+    assert len(evidence["endpoints"]) > 0
+    assert len(evidence["audit_trail"]) >= 5
+
+
+# ==============================================================================
+# M7.7 Authorization Gate Tests
+# ==============================================================================
+
+def test_authorization_status_values():
+    assert AuthorizationStatus.AUTHORIZED == "AUTHORIZED"
+    assert AuthorizationStatus.UNAUTHORIZED == "UNAUTHORIZED"
+    assert AuthorizationStatus.EXPIRED == "EXPIRED"
+    assert AuthorizationStatus.REVOKED == "REVOKED"
+
+
+def test_permission_grant_validity():
+    grant_valid = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead SecOps",
+    )
+    assert grant_valid.is_valid() is True
+
+    grant_unauth = PermissionGrant(
+        status=AuthorizationStatus.UNAUTHORIZED,
+    )
+    assert grant_unauth.is_valid() is False
+
+    grant_revoked = PermissionGrant(
+        status=AuthorizationStatus.REVOKED,
+    )
+    assert grant_revoked.is_valid() is False
+
+    # Expired timestamp
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    grant_expired = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        valid_until=yesterday,
+    )
+    assert grant_expired.is_valid() is False
+
+    # Future timestamp
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    grant_future = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        valid_until=tomorrow,
+    )
+    assert grant_future.is_valid() is True
+
+
+def test_agent_run_without_permission_denied():
+    """Agent created without explicit AUTHORIZED permission must raise PermissionError on run()."""
+    agent = SecurityResearchAgent(
+        target="http://example.com",
+        allowed_domains=["example.com"],
+        # No permission provided -> defaults to UNAUTHORIZED
+    )
+
+    try:
+        agent.run()
+        assert False, "Expected PermissionError was not raised"
+    except PermissionError as exc:
+        assert "AUTHORIZATION DENIED" in str(exc)
+
+    # Verify denial is recorded in audit trail
+    denied_events = [e for e in agent.audit.events if e.event_type == "AUTHORIZATION_DENIED"]
+    assert len(denied_events) > 0
+    assert denied_events[0].status == "DENIED"
+
+
+def test_agent_fetch_refuses_when_permission_revoked():
+    """Direct fetch() call must also refuse execution when permission is revoked."""
+    agent = SecurityResearchAgent(
+        target="http://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(status=AuthorizationStatus.REVOKED),
+    )
+
+    try:
+        agent.fetch()
+        assert False, "Expected PermissionError was not raised"
+    except PermissionError as exc:
+        assert "authorization policy" in str(exc).lower() or "revoked" in str(exc).lower()
+
+
+# ==============================================================================
+# M7.7 Endpoint Intelligence Tests
+# ==============================================================================
+
+def test_endpoint_inventory_relative_resolution_and_dedup():
+    scope = ScopeManager(["example.com"])
+    inventory = EndpointInventory(base_url="https://example.com/subfolder/page.html", scope_manager=scope)
+
+    # 1. Relative paths
+    ep1 = inventory.add_endpoint("/api/v1/users", method="GET", endpoint_type="link")
+    assert ep1.url == "https://example.com/api/v1/users"
+    assert ep1.path == "/api/v1/users"
+    assert ep1.is_in_scope is True
+
+    # 2. Relative file
+    ep2 = inventory.add_endpoint("assets/app.js", method="GET", endpoint_type="script")
+    assert ep2.url == "https://example.com/subfolder/assets/app.js"
+
+    # 3. Deduplication (same method and normalized url)
+    ep1_dup = inventory.add_endpoint("/api/v1/users", method="GET")
+    assert len(inventory.endpoints) == 2
+    assert ep1_dup is ep1
+
+    # Different method is distinct
+    ep1_post = inventory.add_endpoint("/api/v1/users", method="POST", endpoint_type="form")
+    assert len(inventory.endpoints) == 3
+    assert ep1_post.method == "POST"
+
+
+def test_endpoint_inventory_ignores_non_http_schemes():
+    inventory = EndpointInventory(base_url="https://example.com")
+
+    assert inventory.add_endpoint("javascript:alert(1)") is None
+    assert inventory.add_endpoint("mailto:security@example.com") is None
+    assert inventory.add_endpoint("tel:+1234567890") is None
+    assert inventory.add_endpoint("#top-section") is None
+    assert inventory.add_endpoint("data:text/html;base64,PHNjcmlwdD4=") is None
+    assert len(inventory.endpoints) == 0
+
+
+def test_endpoint_scope_classification():
+    scope = ScopeManager(["example.com"])
+    inventory = EndpointInventory(base_url="https://example.com", scope_manager=scope)
+
+    in_scope_ep = inventory.add_endpoint("https://api.example.com/v2/items")
+    assert in_scope_ep.is_in_scope is True
+
+    out_scope_ep = inventory.add_endpoint("https://cdn.thirdparty.com/library.js")
+    assert out_scope_ep.is_in_scope is False
+
+    in_scope_list = inventory.get_in_scope()
+    assert len(in_scope_list) == 1
+    assert in_scope_list[0].url == "https://api.example.com/v2/items"
+
+
+# ==============================================================================
+# M7.7 Evidence & Cryptographic Integrity Tests
+# ==============================================================================
+
+def test_evidence_bundle_sha256_digest():
+    raw_payload = b"Hello, secure DARK-EYE world! 12345"
+    expected_digest = hashlib.sha256(raw_payload).hexdigest()
+
+    bundle = EvidenceBundle(
+        target="https://example.com",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        sha256_digest=expected_digest,
+    )
+
+    data = bundle.to_dict()
+    assert data["sha256_digest"] == expected_digest
+    assert len(data["sha256_digest"]) == 64
+
+
+# ==============================================================================
+# M7.7 Audit Trail & Reporting Tests
+# ==============================================================================
+
+def test_audit_trail_lifecycle_events():
+    audit = AuditTrail(target="https://target.local")
+
+    e1 = audit.record("SCOPE_EVALUATED", {"allowed": True}, status="OK")
+    e2 = audit.record("AUTHORIZATION_CHECKED", {"status": "AUTHORIZED"}, status="OK")
+    e3 = audit.record("HTTP_DISPATCHED", {"url": "https://target.local"}, status="OK")
+    e4 = audit.record("FETCH_COMPLETED", {"status": 200}, status="OK")
+    e5 = audit.record("FINDINGS_VALIDATED", {"total": 3}, status="OK")
+
+    events = audit.to_list()
+    assert len(events) == 5
+    assert [e["event_type"] for e in events] == [
+        "SCOPE_EVALUATED",
+        "AUTHORIZATION_CHECKED",
+        "HTTP_DISPATCHED",
+        "FETCH_COMPLETED",
+        "FINDINGS_VALIDATED",
+    ]
+
+
+def test_m77_report_serialization_with_endpoints_and_audit(tmp_path):
+    """Verify that save_report writes M7.7 evidence, endpoints, and audit trail into JSON and MD."""
+    result = {
+        "evidence": {
+            "target": "https://vault.corp.local",
+            "timestamp": "2026-09-07T12:00:00Z",
+            "scope_verified": True,
+            "authorization_verified": True,
+            "sha256_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "program": {"program_id": "VAULT-ASSESSMENT"},
+            "permission": {"status": "AUTHORIZED"},
+            "endpoints": [
+                {
+                    "url": "https://vault.corp.local/login",
+                    "path": "/login",
+                    "method": "POST",
+                    "endpoint_type": "form",
+                    "is_in_scope": True,
+                },
+                {
+                    "url": "https://cdn.external.com/script.js",
+                    "path": "/script.js",
+                    "method": "GET",
+                    "endpoint_type": "script",
+                    "is_in_scope": False,
+                },
+            ],
+            "audit_trail": [
+                {"event_type": "SCOPE_EVALUATED", "timestamp": "2026-09-07T12:00:01Z", "status": "OK"},
+                {"event_type": "AUTHORIZATION_CHECKED", "timestamp": "2026-09-07T12:00:02Z", "status": "OK"},
+            ],
+        },
+        "findings": [
+            {
+                "title": "Missing Content-Security-Policy",
+                "severity": "medium",
+                "confidence": 95,
+                "evidence": "No CSP header found",
+                "recommendation": "Deploy CSP",
+                "validation": {
+                    "status": "VALIDATED",
+                    "rechecked": True,
+                    "evidence_reproduced": True,
+                    "reason": "Confirmed absent",
+                },
+            }
+        ],
+    }
+
+    json_path, md_path = save_report(result, output_dir=str(tmp_path))
+
+    assert json_path.exists()
+    assert md_path.exists()
+
+    md_content = md_path.read_text(encoding="utf-8")
+    assert "Target: `https://vault.corp.local`" in md_content
+    assert "Program ID: `VAULT-ASSESSMENT`" in md_content
+    assert "Response SHA-256:" in md_content
+    assert "Discovered Endpoints (Passive Inventory)" in md_content
+    assert "https://vault.corp.local/login" in md_content
+    assert "Research Audit Trail" in md_content
+    assert "SCOPE_EVALUATED" in md_content
