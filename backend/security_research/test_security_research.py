@@ -1039,3 +1039,63 @@ def test_existing_m76_validation_behavior_intact():
     assert finding.validation["status"] == ValidationStatus.VALIDATED.value
     assert finding.confidence == 95
     assert finding.severity == "medium"
+
+# ============================================================
+# DARK-EYE M7.8 Security Regression Tests
+# ============================================================
+
+def test_permission_grant_malformed_expiry_fails_closed():
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead SecOps",
+        valid_until="not-a-valid-iso-timestamp",
+    )
+    assert grant.is_valid() is False
+
+
+def test_permission_grant_empty_expiry_fails_closed_when_supplied():
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead SecOps",
+        valid_until="",
+    )
+    assert grant.is_valid() is False
+
+
+def test_scope_exact_host_restriction_wins_over_broad_parent_target():
+    targets = [
+        ScopeTarget(host="example.com", exact_host=False),
+        ScopeTarget(host="admin.example.com", exact_host=True),
+    ]
+    manager = ScopeManager(targets=targets)
+    decision = manager.evaluate_scope("https://dev.admin.example.com/")
+    assert decision.allowed is False
+    assert decision.reason == ScopeReason.SUBDOMAIN_NOT_ALLOWED
+
+
+def test_scope_exact_host_restriction_is_order_independent():
+    targets = [
+        ScopeTarget(host="example.com", exact_host=False),
+        ScopeTarget(host="admin.example.com", exact_host=True),
+    ]
+    manager_forward = ScopeManager(targets=targets)
+    manager_reverse = ScopeManager(targets=list(reversed(targets)))
+    url = "https://dev.admin.example.com/"
+    decision_forward = manager_forward.evaluate_scope(url)
+    decision_reverse = manager_reverse.evaluate_scope(url)
+    assert decision_forward.allowed is False
+    assert decision_reverse.allowed is False
+    assert decision_forward.reason == ScopeReason.SUBDOMAIN_NOT_ALLOWED
+    assert decision_reverse.reason == ScopeReason.SUBDOMAIN_NOT_ALLOWED
+
+
+def test_scope_more_specific_target_controls_port_policy():
+    targets = [
+        ScopeTarget(host="example.com", exact_host=False, allowed_ports=None),
+        ScopeTarget(host="admin.example.com", exact_host=True, allowed_ports={8443}),
+    ]
+    manager = ScopeManager(targets=targets)
+    decision = manager.evaluate_scope("https://admin.example.com/")
+    assert decision.allowed is False
+    assert decision.reason == ScopeReason.PORT_NOT_ALLOWED
+    assert decision.port == 443

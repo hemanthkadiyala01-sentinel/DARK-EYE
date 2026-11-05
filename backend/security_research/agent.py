@@ -77,16 +77,23 @@ class PermissionGrant:
             return False
         if not self.allow_passive:
             return False
-        if self.valid_until:
+        if self.valid_until is not None:
+            if not isinstance(self.valid_until, str) or not self.valid_until.strip():
+                return False
+
             try:
-                until_dt = datetime.fromisoformat(self.valid_until)
+                until_dt = datetime.fromisoformat(
+                    self.valid_until.strip().replace("Z", "+00:00")
+                )
                 if until_dt.tzinfo is None:
                     until_dt = until_dt.replace(tzinfo=timezone.utc)
+
                 now_dt = datetime.now(timezone.utc)
-                if now_dt > until_dt:
+                if now_dt >= until_dt:
                     return False
-            except Exception:
-                pass
+            except (ValueError, TypeError, OverflowError):
+                return False
+
         return True
 
     def is_action_allowed(self, action: Union[ResearchAction, str]) -> bool:
@@ -337,31 +344,72 @@ class ScopeManager:
                     details={"excluded_domain": exc_d},
                 )
 
-        # 2. Match targets
-        matched_target: Optional[ScopeTarget] = None
-        subdomain_denied_target: Optional[ScopeTarget] = None
+        # 2. Match targets deterministically.
+        # Exact hostname matches take precedence over wildcard parent matches.
+        # For subdomains, the most-specific applicable target controls.
+        exact_matches: List[ScopeTarget] = []
+        wildcard_matches: List[ScopeTarget] = []
+        subdomain_denied_targets: List[ScopeTarget] = []
 
         for target in self.targets:
-            if hostname == target.host:
-                matched_target = target
-                break
-            elif hostname.endswith("." + target.host):
-                if target.exact_host:
-                    subdomain_denied_target = target
-                else:
-                    matched_target = target
-                    break
+            target_host = target.host.lower().strip()
 
-        if not matched_target:
-            if subdomain_denied_target:
+            if hostname == target_host:
+                exact_matches.append(target)
+            elif hostname.endswith("." + target_host):
+                if target.exact_host:
+                    subdomain_denied_targets.append(target)
+                else:
+                    wildcard_matches.append(target)
+
+        matched_target: Optional[ScopeTarget] = None
+
+        if exact_matches:
+            # Prefer the more restrictive configured port policy.
+            exact_matches.sort(
+                key=lambda target: (
+                    len(target.host),
+                    target.allowed_ports is not None,
+                    target.host,
+                ),
+                reverse=True,
+            )
+            matched_target = exact_matches[0]
+
+        else:
+            best_wildcard = max(
+                wildcard_matches,
+                key=lambda target: (len(target.host), target.host),
+                default=None,
+            )
+
+            best_restriction = max(
+                subdomain_denied_targets,
+                key=lambda target: (len(target.host), target.host),
+                default=None,
+            )
+
+            # A specific exact-host restriction must not be bypassed
+            # by a broader parent-domain wildcard grant.
+            if best_restriction is not None and (
+                best_wildcard is None
+                or len(best_restriction.host) >= len(best_wildcard.host)
+            ):
                 return ScopeDecision(
                     url=url,
                     allowed=False,
                     reason=ScopeReason.SUBDOMAIN_NOT_ALLOWED,
-                    matched_target=subdomain_denied_target,
+                    matched_target=best_restriction,
                     hostname=hostname,
-                    details={"target_host": subdomain_denied_target.host, "exact_host": True},
+                    details={
+                        "target_host": best_restriction.host,
+                        "exact_host": True,
+                    },
                 )
+
+            matched_target = best_wildcard
+
+        if not matched_target:
             return ScopeDecision(
                 url=url,
                 allowed=False,
