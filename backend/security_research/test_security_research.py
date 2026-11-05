@@ -16,6 +16,10 @@ from backend.security_research.agent import (
     EvidenceBundle,
     AuditEvent,
     AuditTrail,
+    ResearchAction,
+    ScopeTarget,
+    ScopeDecision,
+    ScopeReason,
 )
 from backend.security_research.validator import (
     FindingValidator,
@@ -456,7 +460,6 @@ def test_agent_run_without_permission_denied():
     agent = SecurityResearchAgent(
         target="http://example.com",
         allowed_domains=["example.com"],
-        # No permission provided -> defaults to UNAUTHORIZED
     )
 
     try:
@@ -465,7 +468,6 @@ def test_agent_run_without_permission_denied():
     except PermissionError as exc:
         assert "AUTHORIZATION DENIED" in str(exc)
 
-    # Verify denial is recorded in audit trail
     denied_events = [e for e in agent.audit.events if e.event_type == "AUTHORIZATION_DENIED"]
     assert len(denied_events) > 0
     assert denied_events[0].status == "DENIED"
@@ -646,3 +648,394 @@ def test_m77_report_serialization_with_endpoints_and_audit(tmp_path):
     assert "https://vault.corp.local/login" in md_content
     assert "Research Audit Trail" in md_content
     assert "SCOPE_EVALUATED" in md_content
+
+
+# ==============================================================================
+# M7.8 ResearchAction & Action-Aware Authorization Tests (A - F)
+# ==============================================================================
+
+def test_research_action_enum():
+    """A. ResearchAction enum must define standard passive research actions."""
+    assert ResearchAction.PASSIVE_RECON.value == "PASSIVE_RECON"
+    assert ResearchAction.HEADER_ANALYSIS.value == "HEADER_ANALYSIS"
+    assert ResearchAction.ENDPOINT_DISCOVERY.value == "ENDPOINT_DISCOVERY"
+    assert ResearchAction.FINDING_VALIDATION.value == "FINDING_VALIDATION"
+    assert ResearchAction.REPORT_GENERATION.value == "REPORT_GENERATION"
+
+
+def test_authorized_action_succeeds():
+    """B. Authorized action specified in allowed_actions must succeed."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead Auditor",
+        allowed_actions={ResearchAction.PASSIVE_RECON, ResearchAction.HEADER_ANALYSIS},
+    )
+    assert grant.is_action_allowed(ResearchAction.PASSIVE_RECON) is True
+    assert grant.is_action_allowed(ResearchAction.HEADER_ANALYSIS) is True
+    assert grant.is_action_allowed("PASSIVE_RECON") is True
+
+
+def test_unauthorized_action_is_denied():
+    """C. Action not explicitly authorized in allowed_actions must be denied."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead Auditor",
+        allowed_actions={ResearchAction.PASSIVE_RECON},
+    )
+    assert grant.is_action_allowed(ResearchAction.PASSIVE_RECON) is True
+    assert grant.is_action_allowed(ResearchAction.ENDPOINT_DISCOVERY) is False
+    assert grant.is_action_allowed(ResearchAction.FINDING_VALIDATION) is False
+    assert grant.is_action_allowed("EXPLOIT_ACTION") is False
+
+
+def test_expired_authorization_denies_action():
+    """D. Expired authorization must deny all actions."""
+    past_date = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        valid_until=past_date,
+        allowed_actions={ResearchAction.PASSIVE_RECON},
+    )
+    assert grant.is_action_allowed(ResearchAction.PASSIVE_RECON) is False
+
+
+def test_revoked_authorization_denies_action():
+    """E. Revoked authorization must deny all actions."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.REVOKED,
+        allowed_actions={ResearchAction.PASSIVE_RECON},
+    )
+    assert grant.is_action_allowed(ResearchAction.PASSIVE_RECON) is False
+
+
+def test_passive_action_respects_allow_passive():
+    """F. If allow_passive is False, passive actions must be denied."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        allow_passive=False,
+        allowed_actions={ResearchAction.PASSIVE_RECON},
+    )
+    assert grant.is_action_allowed(ResearchAction.PASSIVE_RECON) is False
+
+
+# ==============================================================================
+# M7.8 Scope Intelligence Tests (G - N)
+# ==============================================================================
+
+def test_exact_host_scope_works():
+    """G. ScopeTarget with exact_host=True allows the exact host."""
+    target = ScopeTarget(host="secure.example.com", exact_host=True)
+    manager = ScopeManager(targets=[target])
+
+    decision = manager.evaluate_scope("https://secure.example.com/api")
+    assert decision.allowed is True
+    assert decision.reason == ScopeReason.ALLOWED
+    assert decision.hostname == "secure.example.com"
+
+
+def test_configured_subdomain_behavior_works():
+    """H. ScopeTarget with exact_host=False allows subdomains."""
+    target = ScopeTarget(host="example.com", exact_host=False)
+    manager = ScopeManager(targets=[target])
+
+    decision = manager.evaluate_scope("https://sub.api.example.com/status")
+    assert decision.allowed is True
+    assert decision.reason == ScopeReason.ALLOWED
+
+
+def test_unconfigured_subdomain_is_denied():
+    """I. Subdomain targeting a target with exact_host=True is denied with SUBDOMAIN_NOT_ALLOWED."""
+    target = ScopeTarget(host="corp.local", exact_host=True)
+    manager = ScopeManager(targets=[target])
+
+    decision = manager.evaluate_scope("https://dev.corp.local/login")
+    assert decision.allowed is False
+    assert decision.reason == ScopeReason.SUBDOMAIN_NOT_ALLOWED
+    assert decision.hostname == "dev.corp.local"
+
+
+def test_allowed_port_works():
+    """J. ScopeTarget with allowed_ports permits requests on that port."""
+    target = ScopeTarget(host="127.0.0.1", exact_host=True, allowed_ports={8765})
+    manager = ScopeManager(targets=[target])
+
+    decision = manager.evaluate_scope("http://127.0.0.1:8765/lab")
+    assert decision.allowed is True
+    assert decision.reason == ScopeReason.ALLOWED
+    assert decision.port == 8765
+
+
+def test_disallowed_port_is_denied():
+    """K. ScopeTarget with allowed_ports denies requests on unlisted ports."""
+    target = ScopeTarget(host="127.0.0.1", exact_host=True, allowed_ports={8765})
+    manager = ScopeManager(targets=[target])
+
+    # Port 80 (default http) is not 8765
+    decision_80 = manager.evaluate_scope("http://127.0.0.1/lab")
+    assert decision_80.allowed is False
+    assert decision_80.reason == ScopeReason.PORT_NOT_ALLOWED
+    assert decision_80.port == 80
+
+    # Port 9000 is not 8765
+    decision_9000 = manager.evaluate_scope("http://127.0.0.1:9000/lab")
+    assert decision_9000.allowed is False
+    assert decision_9000.reason == ScopeReason.PORT_NOT_ALLOWED
+    assert decision_9000.port == 9000
+
+
+def test_excluded_path_is_denied():
+    """L. ScopeTarget and ScopeManager path exclusions deny matching paths."""
+    target = ScopeTarget(
+        host="app.local",
+        exact_host=True,
+        excluded_paths=["/admin", "/logout"],
+    )
+    manager = ScopeManager(targets=[target])
+
+    d_admin = manager.evaluate_scope("https://app.local/admin/users")
+    assert d_admin.allowed is False
+    assert d_admin.reason == ScopeReason.PATH_EXCLUDED
+
+    d_logout = manager.evaluate_scope("https://app.local/logout")
+    assert d_logout.allowed is False
+    assert d_logout.reason == ScopeReason.PATH_EXCLUDED
+
+    d_api = manager.evaluate_scope("https://app.local/api/items")
+    assert d_api.allowed is True
+    assert d_api.reason == ScopeReason.ALLOWED
+
+
+def test_evaluate_scope_returns_useful_reason():
+    """M. evaluate_scope() returns structured ScopeDecision with diagnostic information."""
+    target = ScopeTarget(host="portal.io", exact_host=True, allowed_ports={443})
+    manager = ScopeManager(targets=[target])
+
+    # Case 1: Scheme failure
+    d_scheme = manager.evaluate_scope("ftp://portal.io/files")
+    assert d_scheme.allowed is False
+    assert d_scheme.reason == ScopeReason.INVALID_SCHEME
+
+    # Case 2: Domain not allowed
+    d_domain = manager.evaluate_scope("https://unrelated.com/login")
+    assert d_domain.allowed is False
+    assert d_domain.reason == ScopeReason.DOMAIN_NOT_ALLOWED
+
+    # Case 3: Allowed
+    d_ok = manager.evaluate_scope("https://portal.io/dashboard")
+    assert d_ok.allowed is True
+    assert d_ok.reason == ScopeReason.ALLOWED
+    assert d_ok.matched_target is not None
+    assert d_ok.matched_target.host == "portal.io"
+    assert d_ok.port == 443
+    assert d_ok.path == "/dashboard"
+
+
+def test_is_allowed_backward_compatible():
+    """N. is_allowed() remains backward-compatible boolean wrapper."""
+    manager = ScopeManager(allowed_domains=["legacy.com"])
+    assert manager.is_allowed("https://legacy.com") is True
+    assert manager.is_allowed("https://sub.legacy.com") is True
+    assert manager.is_allowed("https://forbidden.com") is False
+
+
+# ==============================================================================
+# M7.8 Action Gating & Safety Tests (O - R)
+# ==============================================================================
+
+def test_action_denial_creates_audit_event():
+    """O. When an action is denied, an ACTION_AUTHORIZATION_DENIED event is logged."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead SecOps",
+        allowed_actions={ResearchAction.PASSIVE_RECON},  # HEADER_ANALYSIS omitted
+    )
+    agent = SecurityResearchAgent(
+        target="http://example.com",
+        allowed_domains=["example.com"],
+        permission=grant,
+    )
+
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.geturl.return_value = "http://example.com/"
+    mock_response.headers = {"Server": "test-srv"}
+    mock_response.read.return_value = b"<html>Test</html>"
+    mock_cm = MagicMock()
+    mock_cm.__enter__.return_value = mock_response
+
+    with patch("urllib.request.urlopen", return_value=mock_cm):
+        result = agent.run()
+
+    # HEADER_ANALYSIS was skipped and logged as denied
+    denied_events = [
+        e for e in agent.audit.events
+        if e.event_type == "ACTION_AUTHORIZATION_DENIED"
+    ]
+    assert len(denied_events) > 0
+    actions_denied = [e.details.get("action") for e in denied_events]
+    assert ResearchAction.HEADER_ANALYSIS.value in actions_denied
+
+
+def test_network_request_cannot_occur_after_action_authorization_failure():
+    """P. If PASSIVE_RECON is not authorized, network request cannot occur."""
+    grant = PermissionGrant(
+        status=AuthorizationStatus.AUTHORIZED,
+        authorized_by="Lead SecOps",
+        allowed_actions={ResearchAction.HEADER_ANALYSIS},  # PASSIVE_RECON omitted
+    )
+    agent = SecurityResearchAgent(
+        target="http://example.com",
+        allowed_domains=["example.com"],
+        permission=grant,
+    )
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        try:
+            agent.run()
+            assert False, "Expected PermissionError was not raised"
+        except PermissionError as exc:
+            assert "ACTION AUTHORIZATION DENIED" in str(exc)
+
+        # Network dispatch must NEVER be called
+        mock_urlopen.assert_not_called()
+
+    # Verify audit trail logs denial
+    denied_events = [
+        e for e in agent.audit.events
+        if e.event_type == "ACTION_AUTHORIZATION_DENIED"
+    ]
+    assert len(denied_events) > 0
+    assert denied_events[0].details.get("action") == ResearchAction.PASSIVE_RECON.value
+
+
+def test_report_generation_authorized(tmp_path):
+    """REPORT_GENERATION authorization permits report creation."""
+    agent = SecurityResearchAgent(
+        target="https://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(
+            status=AuthorizationStatus.AUTHORIZED,
+            allowed_actions={ResearchAction.REPORT_GENERATION},
+        ),
+    )
+
+    json_path, md_path = agent.generate_report(
+        {"evidence": agent.evidence, "findings": []},
+        output_dir=str(tmp_path),
+    )
+
+    assert json_path.exists()
+    assert md_path.exists()
+
+
+def test_report_generation_denied_when_not_authorized(tmp_path):
+    """REPORT_GENERATION authorization is required before report creation."""
+    agent = SecurityResearchAgent(
+        target="https://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(
+            status=AuthorizationStatus.AUTHORIZED,
+            allowed_actions={ResearchAction.PASSIVE_RECON},
+        ),
+    )
+
+    try:
+        agent.generate_report({"evidence": agent.evidence, "findings": []}, output_dir=str(tmp_path))
+        assert False, "Expected PermissionError was not raised"
+    except PermissionError as exc:
+        assert "REPORT_GENERATION" in str(exc)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_report_generation_denial_creates_audit_event(tmp_path):
+    """Denied report generation records ACTION_AUTHORIZATION_DENIED."""
+    agent = SecurityResearchAgent(
+        target="https://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(
+            status=AuthorizationStatus.AUTHORIZED,
+            allowed_actions={ResearchAction.PASSIVE_RECON},
+        ),
+    )
+
+    try:
+        agent.generate_report({"evidence": agent.evidence, "findings": []}, output_dir=str(tmp_path))
+        assert False, "Expected PermissionError was not raised"
+    except PermissionError:
+        pass
+
+    denied_events = [
+        event for event in agent.audit.events
+        if event.event_type == "ACTION_AUTHORIZATION_DENIED"
+    ]
+    assert denied_events
+    assert denied_events[-1].details["action"] == ResearchAction.REPORT_GENERATION.value
+
+
+def test_unknown_action_is_denied_without_value_error():
+    """Unknown actions are denied and audited instead of leaking ValueError."""
+    agent = SecurityResearchAgent(
+        target="https://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(status=AuthorizationStatus.AUTHORIZED),
+    )
+
+    try:
+        agent.verify_action("FUTURE_ACTION")
+        assert False, "Expected PermissionError was not raised"
+    except PermissionError as exc:
+        assert "Unknown research action" in str(exc)
+
+    denied_events = [
+        event for event in agent.audit.events
+        if event.event_type == "ACTION_AUTHORIZATION_DENIED"
+    ]
+    assert denied_events[-1].details["action"] == "FUTURE_ACTION"
+
+
+def test_endpoint_discovery_does_not_issue_requests():
+    """Q. Endpoint discovery parses and indexes in memory; it NEVER dispatches HTTP requests."""
+    agent = SecurityResearchAgent(
+        target="http://example.com",
+        allowed_domains=["example.com"],
+        permission=PermissionGrant(status=AuthorizationStatus.AUTHORIZED),
+    )
+    html_payload = b"""
+    <html>
+        <form action="/login" method="post"></form>
+        <script src="/static/app.js"></script>
+        <a href="/dashboard">Dashboard</a>
+        <a href="https://external.corp/logout">External</a>
+    </html>
+    """
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        agent.analyze_html(html_payload)
+        mock_urlopen.assert_not_called()
+
+    assert len(agent.inventory.endpoints) >= 4
+    discovered_urls = [ep.url for ep in agent.inventory.endpoints.values()]
+    assert "http://example.com/login" in discovered_urls
+    assert "http://example.com/static/app.js" in discovered_urls
+    assert "http://example.com/dashboard" in discovered_urls
+    assert "https://external.corp/logout" in discovered_urls
+
+
+def test_existing_m76_validation_behavior_intact():
+    """R. Verify M7.6 finding validation behavior remains completely intact in M7.8."""
+    validator = FindingValidator()
+    obs = Observation(
+        title="Missing Content-Security-Policy",
+        severity="medium",
+        confidence=85,
+        evidence="Response did not contain 'content-security-policy'.",
+        recommendation="Deploy CSP.",
+    )
+    context = {
+        "target": "https://secure.example.com",
+        "http": {"headers": {"server": "nginx"}},
+    }
+    finding = validator.validate(obs, context)
+    assert finding.validation["status"] == ValidationStatus.VALIDATED.value
+    assert finding.confidence == 95
+    assert finding.severity == "medium"

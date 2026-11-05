@@ -1,8 +1,8 @@
 """
-DARK-EYE M7.7 command-line entry point.
+DARK-EYE M7.8 command-line entry point.
 
 Usage:
-    python -m backend.security_research.cli https://TARGET --domain DOMAIN [--authorized]
+    python -m backend.security_research.cli https://TARGET --domain DOMAIN [--authorized] [--allow-action ACTION]
 """
 
 import argparse
@@ -12,12 +12,13 @@ from .agent import (
     AuthorizationStatus,
     PermissionGrant,
     ProgramMetadata,
+    ResearchAction,
 )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DARK-EYE authorized security research MVP (M7.7)"
+        description="DARK-EYE authorized security research MVP (M7.8)"
     )
 
     parser.add_argument(
@@ -51,11 +52,18 @@ def main():
         help="Program or engagement identifier."
     )
 
+    parser.add_argument(
+        "--allow-action",
+        action="append",
+        dest="allowed_actions",
+        help="Explicitly permit a specific ResearchAction (e.g. PASSIVE_RECON, HEADER_ANALYSIS). Can be supplied multiple times."
+    )
+
     args = parser.parse_args()
 
     print()
     print("==============================================")
-    print(" DARK-EYE SECURITY RESEARCH AGENT - M7.7")
+    print(" DARK-EYE SECURITY RESEARCH AGENT - M7.8")
     print("==============================================")
     print()
 
@@ -63,6 +71,17 @@ def main():
     print(f"[+] Allowed domains: {', '.join(args.domain)}")
     print(f"[+] Program ID: {args.program}")
     print(f"[+] Authorized flag provided: {args.authorized}")
+
+    allowed_actions = None
+    if args.allowed_actions:
+        allowed_actions = set()
+        for act_str in args.allowed_actions:
+            try:
+                allowed_actions.add(ResearchAction(act_str.upper()))
+            except ValueError:
+                print(f"[ERROR] Unknown ResearchAction: '{act_str}'")
+                return
+        print(f"[+] Allowed actions restricted to: {', '.join(a.value for a in allowed_actions)}")
     print()
 
     try:
@@ -75,6 +94,7 @@ def main():
             status=permission_status,
             authorized_by=args.authorized_by,
             scope_reference=args.program,
+            allowed_actions=allowed_actions,
         )
         program = ProgramMetadata(
             program_id=args.program,
@@ -88,14 +108,14 @@ def main():
             program=program,
         )
 
-        print("[+] Verifying scope...")
-        agent.verify_scope()
-        print("[OK] Target is inside configured scope.")
-        print()
-
         print("[+] Verifying authorization...")
         agent.verify_authorization()
         print("[OK] Explicit authorization grant verified.")
+        print()
+
+        print("[+] Verifying scope...")
+        agent.verify_scope()
+        print("[OK] Target is inside configured scope.")
         print()
 
         print("[+] Performing passive HTTP research...")
@@ -130,7 +150,7 @@ def main():
 
         print()
 
-        json_path, md_path = save_report(result)
+        json_path, md_path = agent.generate_report(result)
 
         print(f"[+] Evidence: {json_path}")
         print(f"[+] Report:   {md_path}")

@@ -1,11 +1,13 @@
 """
 DARK-EYE Security Research Agent
-M7.7
+M7.8
 
 Scope-controlled, explicitly authorized passive security research for approved targets.
 Features:
-- Program and scope metadata with path boundary support
-- Explicit authorization lifecycle and verification gate (AUTHORIZED, UNAUTHORIZED, EXPIRED, REVOKED)
+- ResearchAction enum defining fine-grained, passive research permissions
+- Structured ScopeTarget definition with exact host vs. wildcard and port enforcement
+- ScopeDecision and ScopeReason providing explanatory scope evaluation
+- Explicit authorization lifecycle and action-aware verification gate
 - Passive endpoint inventory with normalization, scope classification, and deduplication
 - Cryptographic evidence bundling with SHA-256 payload integrity
 - Security audit trail recording all critical decision milestones
@@ -27,8 +29,29 @@ from .validator import FindingValidator, Observation, ValidationResult, Validati
 
 
 # ==============================================================================
-# Authorization Models
+# Research Actions & Authorization Models
 # ==============================================================================
+
+class ResearchAction(str, Enum):
+    """
+    Explicitly permitted passive security research actions.
+    Active exploitation, brute force, fuzzing, or destructive actions are strictly excluded.
+    """
+    PASSIVE_RECON = "PASSIVE_RECON"
+    HEADER_ANALYSIS = "HEADER_ANALYSIS"
+    ENDPOINT_DISCOVERY = "ENDPOINT_DISCOVERY"
+    FINDING_VALIDATION = "FINDING_VALIDATION"
+    REPORT_GENERATION = "REPORT_GENERATION"
+
+
+DEFAULT_PASSIVE_ACTIONS: Set[ResearchAction] = {
+    ResearchAction.PASSIVE_RECON,
+    ResearchAction.HEADER_ANALYSIS,
+    ResearchAction.ENDPOINT_DISCOVERY,
+    ResearchAction.FINDING_VALIDATION,
+    ResearchAction.REPORT_GENERATION,
+}
+
 
 class AuthorizationStatus(str, Enum):
     AUTHORIZED = "AUTHORIZED"
@@ -45,6 +68,7 @@ class PermissionGrant:
     scope_reference: str = ""
     valid_until: Optional[str] = None  # ISO timestamp (e.g. 2026-12-31T23:59:59Z)
     allow_passive: bool = True
+    allowed_actions: Optional[Set[Union[ResearchAction, str]]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def is_valid(self) -> bool:
@@ -65,16 +89,126 @@ class PermissionGrant:
                 pass
         return True
 
+    def is_action_allowed(self, action: Union[ResearchAction, str]) -> bool:
+        """
+        Determines if a specific research action is authorized.
+        Denies by default for invalid/expired/revoked authorization or unknown actions.
+        """
+        if not self.is_valid():
+            return False
+
+        # Convert to ResearchAction enum
+        if isinstance(action, ResearchAction):
+            act_enum = action
+        else:
+            try:
+                act_enum = ResearchAction(str(action))
+            except ValueError:
+                # Unknown/unrecognized actions are strictly denied
+                return False
+
+        if not self.allow_passive:
+            return False
+
+        # If allowed_actions is explicitly specified, only those actions are permitted
+        if self.allowed_actions is not None:
+            normalized_allowed = set()
+            for a in self.allowed_actions:
+                if isinstance(a, ResearchAction):
+                    normalized_allowed.add(a)
+                elif str(a) in ResearchAction._value2member_map_:
+                    normalized_allowed.add(ResearchAction(str(a)))
+                else:
+                    normalized_allowed.add(str(a))
+            return act_enum in normalized_allowed
+
+        # If allowed_actions is None (legacy M7.7 grant), allow standard passive actions
+        return act_enum in DEFAULT_PASSIVE_ACTIONS
+
     def to_dict(self) -> Dict[str, Any]:
         stat = self.status.value if isinstance(self.status, Enum) else str(self.status)
+        actions_list = None
+        if self.allowed_actions is not None:
+            actions_list = [
+                a.value if isinstance(a, Enum) else str(a)
+                for a in self.allowed_actions
+            ]
         return {
             "status": stat,
             "authorized_by": self.authorized_by,
             "scope_reference": self.scope_reference,
             "valid_until": self.valid_until,
             "allow_passive": self.allow_passive,
+            "allowed_actions": actions_list,
             "is_valid": self.is_valid(),
             "metadata": dict(self.metadata),
+        }
+
+
+# ==============================================================================
+# Scope Intelligence Models
+# ==============================================================================
+
+class ScopeReason(str, Enum):
+    ALLOWED = "ALLOWED"
+    INVALID_SCHEME = "INVALID_SCHEME"
+    INVALID_URL = "INVALID_URL"
+    DOMAIN_NOT_ALLOWED = "DOMAIN_NOT_ALLOWED"
+    SUBDOMAIN_NOT_ALLOWED = "SUBDOMAIN_NOT_ALLOWED"
+    PORT_NOT_ALLOWED = "PORT_NOT_ALLOWED"
+    PATH_EXCLUDED = "PATH_EXCLUDED"
+    EXPLICITLY_EXCLUDED = "EXPLICITLY_EXCLUDED"
+
+
+@dataclass
+class ScopeTarget:
+    """Structured scope target boundary definition."""
+    host: str
+    exact_host: bool = False
+    allowed_ports: Optional[Set[int]] = None
+    excluded_paths: List[str] = field(default_factory=list)
+    description: str = ""
+
+    def __post_init__(self):
+        self.host = self.host.lower().strip().lstrip("*.")
+        if self.allowed_ports is not None:
+            self.allowed_ports = set(self.allowed_ports)
+        if self.excluded_paths:
+            self.excluded_paths = [p.lower().strip() for p in self.excluded_paths if p]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "host": self.host,
+            "exact_host": self.exact_host,
+            "allowed_ports": sorted(list(self.allowed_ports)) if self.allowed_ports is not None else None,
+            "excluded_paths": list(self.excluded_paths),
+            "description": self.description,
+        }
+
+
+@dataclass
+class ScopeDecision:
+    """Detailed result of scope evaluation including reason and matched target."""
+    url: str
+    allowed: bool
+    reason: Union[ScopeReason, str]
+    matched_target: Optional[ScopeTarget] = None
+    hostname: Optional[str] = None
+    port: Optional[int] = None
+    path: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        reason_val = self.reason.value if isinstance(self.reason, Enum) else str(self.reason)
+        return {
+            "url": self.url,
+            "allowed": self.allowed,
+            "reason": reason_val,
+            "matched_target": self.matched_target.to_dict() if self.matched_target else None,
+            "hostname": self.hostname,
+            "port": self.port,
+            "path": self.path,
+            "details": dict(self.details),
         }
 
 
@@ -89,6 +223,8 @@ class ProgramMetadata:
     name: str = "Authorized Research Engagement"
     allowed_domains: List[str] = field(default_factory=list)
     excluded_paths: List[str] = field(default_factory=list)
+    targets: List[ScopeTarget] = field(default_factory=list)
+    excluded_domains: List[str] = field(default_factory=list)
     policy_url: Optional[str] = None
     contact: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -99,6 +235,8 @@ class ProgramMetadata:
             "name": self.name,
             "allowed_domains": list(self.allowed_domains),
             "excluded_paths": list(self.excluded_paths),
+            "targets": [t.to_dict() if hasattr(t, "to_dict") else t for t in self.targets],
+            "excluded_domains": list(self.excluded_domains),
             "policy_url": self.policy_url,
             "contact": self.contact,
             "metadata": dict(self.metadata),
@@ -106,60 +244,187 @@ class ProgramMetadata:
 
 
 class ScopeManager:
-    """Enforces target domain boundaries and out-of-scope path exclusions."""
+    """
+    Enforces target domain boundaries, ports, and out-of-scope path exclusions.
+    Provides structured ScopeDecision evaluations while maintaining is_allowed backward compatibility.
+    """
     def __init__(
         self,
-        allowed_domains=None,
+        allowed_domains: Optional[List[Union[str, ScopeTarget]]] = None,
         program: Optional[ProgramMetadata] = None,
         excluded_paths: Optional[List[str]] = None,
+        targets: Optional[List[ScopeTarget]] = None,
+        excluded_domains: Optional[List[str]] = None,
     ):
-        domains = list(allowed_domains or [])
-        if program and program.allowed_domains:
-            domains.extend(program.allowed_domains)
-
-        self.allowed_domains: Set[str] = {
-            d.lower().strip().lstrip("*.")
-            for d in domains
-            if d and d.strip()
-        }
         self.program = program
+        self.targets: List[ScopeTarget] = []
 
-        all_excluded = list(excluded_paths or [])
+        # 1. Ingest structured targets
+        if targets:
+            self.targets.extend(targets)
+        if program and program.targets:
+            self.targets.extend(program.targets)
+
+        # 2. Ingest allowed_domains (convert strings to ScopeTarget)
+        legacy_domains = list(allowed_domains or [])
+        if program and program.allowed_domains:
+            legacy_domains.extend(program.allowed_domains)
+
+        for d in legacy_domains:
+            if isinstance(d, ScopeTarget):
+                self.targets.append(d)
+            elif isinstance(d, str) and d.strip():
+                clean_host = d.lower().strip().lstrip("*.")
+                self.targets.append(ScopeTarget(host=clean_host, exact_host=False))
+
+        # Backward compatibility attribute: allowed_domains set
+        self.allowed_domains: Set[str] = {t.host for t in self.targets}
+
+        # 3. Ingest path exclusions
+        all_excluded_paths = list(excluded_paths or [])
         if program and program.excluded_paths:
-            all_excluded.extend(program.excluded_paths)
+            all_excluded_paths.extend(program.excluded_paths)
 
         self.excluded_paths: Set[str] = {
-            p.lower().strip() for p in all_excluded if p and p.strip()
+            p.lower().strip() for p in all_excluded_paths if p and p.strip()
         }
 
-    def is_allowed(self, url: str) -> bool:
-        parsed = urlparse(url)
+        # 4. Ingest domain exclusions
+        all_excluded_domains = list(excluded_domains or [])
+        if program and program.excluded_domains:
+            all_excluded_domains.extend(program.excluded_domains)
 
+        self.excluded_domains: Set[str] = {
+            d.lower().strip().lstrip("*.") for d in all_excluded_domains if d and d.strip()
+        }
+
+    def evaluate_scope(self, url: str) -> ScopeDecision:
+        """Evaluates whether a target URL is in scope, returning structured reasoning."""
+        if not url or not isinstance(url, str):
+            return ScopeDecision(
+                url=str(url),
+                allowed=False,
+                reason=ScopeReason.INVALID_URL,
+                details={"error": "URL is empty or not a string"},
+            )
+
+        parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            return False
+            return ScopeDecision(
+                url=url,
+                allowed=False,
+                reason=ScopeReason.INVALID_SCHEME,
+                details={"scheme": parsed.scheme},
+            )
 
         hostname = (parsed.hostname or "").lower()
         if not hostname:
-            return False
+            return ScopeDecision(
+                url=url,
+                allowed=False,
+                reason=ScopeReason.INVALID_URL,
+                details={"error": "Missing hostname in URL"},
+            )
 
-        domain_matched = False
-        for domain in self.allowed_domains:
-            if hostname == domain or hostname.endswith("." + domain):
-                domain_matched = True
+        # 1. Check explicit domain exclusions
+        for exc_d in self.excluded_domains:
+            if hostname == exc_d or hostname.endswith("." + exc_d):
+                return ScopeDecision(
+                    url=url,
+                    allowed=False,
+                    reason=ScopeReason.EXPLICITLY_EXCLUDED,
+                    hostname=hostname,
+                    details={"excluded_domain": exc_d},
+                )
+
+        # 2. Match targets
+        matched_target: Optional[ScopeTarget] = None
+        subdomain_denied_target: Optional[ScopeTarget] = None
+
+        for target in self.targets:
+            if hostname == target.host:
+                matched_target = target
                 break
+            elif hostname.endswith("." + target.host):
+                if target.exact_host:
+                    subdomain_denied_target = target
+                else:
+                    matched_target = target
+                    break
 
-        if not domain_matched:
-            return False
+        if not matched_target:
+            if subdomain_denied_target:
+                return ScopeDecision(
+                    url=url,
+                    allowed=False,
+                    reason=ScopeReason.SUBDOMAIN_NOT_ALLOWED,
+                    matched_target=subdomain_denied_target,
+                    hostname=hostname,
+                    details={"target_host": subdomain_denied_target.host, "exact_host": True},
+                )
+            return ScopeDecision(
+                url=url,
+                allowed=False,
+                reason=ScopeReason.DOMAIN_NOT_ALLOWED,
+                hostname=hostname,
+                details={"configured_targets": [t.host for t in self.targets]},
+            )
 
-        # Path boundary / exclusion check
-        if self.excluded_paths and parsed.path:
-            norm_path = parsed.path.lower()
-            for exc in self.excluded_paths:
-                exc_clean = exc.rstrip("/")
-                if norm_path == exc_clean or norm_path.startswith(exc_clean + "/"):
-                    return False
+        # 3. Port check
+        effective_port = parsed.port
+        if effective_port is None:
+            effective_port = 443 if parsed.scheme == "https" else 80
 
-        return True
+        if matched_target.allowed_ports is not None and len(matched_target.allowed_ports) > 0:
+            if effective_port not in matched_target.allowed_ports:
+                return ScopeDecision(
+                    url=url,
+                    allowed=False,
+                    reason=ScopeReason.PORT_NOT_ALLOWED,
+                    matched_target=matched_target,
+                    hostname=hostname,
+                    port=effective_port,
+                    path=parsed.path,
+                    details={
+                        "allowed_ports": sorted(list(matched_target.allowed_ports)),
+                        "requested_port": effective_port,
+                    },
+                )
+
+        # 4. Path exclusion check
+        path = parsed.path or "/"
+        norm_path = path.lower()
+        all_excluded_paths = set(self.excluded_paths)
+        if matched_target.excluded_paths:
+            all_excluded_paths.update(matched_target.excluded_paths)
+
+        for exc in all_excluded_paths:
+            exc_clean = exc.rstrip("/")
+            if norm_path == exc_clean or norm_path.startswith(exc_clean + "/"):
+                return ScopeDecision(
+                    url=url,
+                    allowed=False,
+                    reason=ScopeReason.PATH_EXCLUDED,
+                    matched_target=matched_target,
+                    hostname=hostname,
+                    port=effective_port,
+                    path=path,
+                    details={"matched_exclusion": exc},
+                )
+
+        return ScopeDecision(
+            url=url,
+            allowed=True,
+            reason=ScopeReason.ALLOWED,
+            matched_target=matched_target,
+            hostname=hostname,
+            port=effective_port,
+            path=path,
+        )
+
+    def is_allowed(self, url: str) -> bool:
+        """Backward-compatible boolean wrapper around evaluate_scope()."""
+        return self.evaluate_scope(url).allowed
 
 
 # ==============================================================================
@@ -409,21 +674,22 @@ class Finding:
 class SecurityResearchAgent:
     """
     Main orchestrator for scoped, authorized, passive security research.
-    Strictly enforces authorization checks before network execution.
+    Strictly enforces authorization checks and action permissions before execution.
     """
     def __init__(
         self,
         target: str,
-        allowed_domains: Optional[List[str]] = None,
+        allowed_domains: Optional[List[Union[str, ScopeTarget]]] = None,
         validator: Optional[FindingValidator] = None,
         permission: Optional[PermissionGrant] = None,
         program: Optional[ProgramMetadata] = None,
+        targets: Optional[List[ScopeTarget]] = None,
     ):
         self.target = target.rstrip("/")
         self.program = program or ProgramMetadata(
             program_id="default-engagement",
             name="Authorized Research Engagement",
-            allowed_domains=list(allowed_domains or []),
+            allowed_domains=[d for d in (allowed_domains or []) if isinstance(d, str)],
         )
         # Explicit authorization grant: if not supplied, defaults to UNAUTHORIZED
         self.permission = permission or PermissionGrant(
@@ -433,6 +699,7 @@ class SecurityResearchAgent:
         self.scope = ScopeManager(
             allowed_domains=allowed_domains,
             program=self.program,
+            targets=targets,
         )
         self.findings: List[Finding] = []
         self.observations: List[Observation] = []
@@ -467,29 +734,40 @@ class SecurityResearchAgent:
         self.evidence = synced
 
     def verify_scope(self) -> bool:
-        allowed = self.scope.is_allowed(self.target)
+        decision = self.scope.evaluate_scope(self.target)
+        allowed = decision.allowed
         self.evidence_bundle.scope_verified = allowed
-        self._sync_evidence()
+        reason_val = decision.reason.value if isinstance(decision.reason, Enum) else str(decision.reason)
 
         if not allowed:
             self.audit.record(
                 event_type="SCOPE_EVALUATED",
-                details={"allowed": False, "target": self.target},
+                details={
+                    "allowed": False,
+                    "target": self.target,
+                    "reason": reason_val,
+                    "decision": decision.to_dict(),
+                },
                 status="DENIED",
             )
             self._sync_evidence()
-            raise PermissionError(f"TARGET OUT OF SCOPE: {self.target}")
+            raise PermissionError(f"TARGET OUT OF SCOPE: {self.target} (Reason: {reason_val})")
 
         self.audit.record(
             event_type="SCOPE_EVALUATED",
-            details={"allowed": True, "target": self.target},
+            details={
+                "allowed": True,
+                "target": self.target,
+                "reason": reason_val,
+                "decision": decision.to_dict(),
+            },
             status="OK",
         )
         self._sync_evidence()
         return True
 
     def verify_authorization(self) -> bool:
-        """Enforces explicit authorization verification."""
+        """Enforces explicit authorization status verification."""
         stat_val = str(
             self.permission.status.value
             if isinstance(self.permission.status, Enum)
@@ -523,14 +801,53 @@ class SecurityResearchAgent:
         self._sync_evidence()
         return True
 
-    def fetch(self):
-        # 1. Enforce scope
-        if not self.scope.is_allowed(self.target):
-            self.audit.record("SCOPE_EVALUATED", {"allowed": False, "target": self.target}, status="DENIED")
+    def verify_action(self, action: Union[ResearchAction, str]) -> bool:
+        """Verifies that a specific research action is permitted by the grant."""
+        try:
+            act_enum = action if isinstance(action, ResearchAction) else ResearchAction(str(action))
+        except (TypeError, ValueError):
+            action_value = str(action)
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": action_value,
+                    "reason": f"Unknown research action '{action_value}' is denied by default",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
             self._sync_evidence()
-            raise PermissionError("Blocked by scope policy.")
+            raise PermissionError(
+                f"ACTION AUTHORIZATION DENIED: Unknown research action '{action_value}' is not permitted."
+            )
 
-        # 2. Enforce explicit authorization
+        if not self.permission.is_action_allowed(act_enum):
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": act_enum.value,
+                    "reason": f"Action '{act_enum.value}' is not permitted by PermissionGrant",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
+            self._sync_evidence()
+            raise PermissionError(
+                f"ACTION AUTHORIZATION DENIED: Action '{act_enum.value}' is not permitted on target '{self.target}'."
+            )
+        return True
+
+    def generate_report(self, result=None, output_dir="security_reports"):
+        """Generate a report only when REPORT_GENERATION is explicitly authorized."""
+        self.verify_action(ResearchAction.REPORT_GENERATION)
+        report_result = result if result is not None else {
+            "evidence": self.evidence,
+            "findings": [asdict(f) for f in self.findings],
+        }
+        return save_report(report_result, output_dir=output_dir)
+
+    def fetch(self):
+        # 1. Enforce authorization validity
         if not self.permission or not self.permission.is_valid():
             stat_val = str(
                 self.permission.status.value
@@ -540,6 +857,28 @@ class SecurityResearchAgent:
             self.audit.record("AUTHORIZATION_DENIED", {"target": self.target, "status": stat_val}, status="DENIED")
             self._sync_evidence()
             raise PermissionError(f"Blocked by authorization policy: explicit AUTHORIZED grant required (current status: {stat_val}).")
+
+        # 2. Enforce action authorization for recon
+        if not self.permission.is_action_allowed(ResearchAction.PASSIVE_RECON):
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": ResearchAction.PASSIVE_RECON.value,
+                    "reason": "PASSIVE_RECON action not permitted",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
+            self._sync_evidence()
+            raise PermissionError(f"Blocked by authorization policy: action '{ResearchAction.PASSIVE_RECON.value}' not permitted on '{self.target}'.")
+
+        # 3. Enforce scope
+        decision = self.scope.evaluate_scope(self.target)
+        if not decision.allowed:
+            reason_val = decision.reason.value if isinstance(decision.reason, Enum) else str(decision.reason)
+            self.audit.record("SCOPE_EVALUATED", {"allowed": False, "target": self.target, "reason": reason_val}, status="DENIED")
+            self._sync_evidence()
+            raise PermissionError(f"Blocked by scope policy: {reason_val}")
 
         request_headers = {
             "User-Agent": "DARK-EYE-SecurityResearch/0.1",
@@ -707,6 +1046,7 @@ class SecurityResearchAgent:
             )
 
     def analyze_html(self, body):
+        """Passively catalogs discovered endpoints in the response body. Never dispatches requests."""
         text = body.decode("utf-8", errors="ignore")
 
         forms = len(re.findall(r"<form\b", text, re.I))
@@ -793,19 +1133,64 @@ class SecurityResearchAgent:
         return self.findings
 
     def run(self):
-        self.verify_scope()
+        # 1. Authorization validity check
         self.verify_authorization()
 
+        # 2. Action authorization check for passive recon
+        self.verify_action(ResearchAction.PASSIVE_RECON)
+
+        # 3. Scope verification check
+        self.verify_scope()
+
+        # 4. Network execution
         response, body = self.fetch()
 
         headers = self.evidence_bundle.http.get("headers", {})
 
-        self.analyze_headers(headers)
-        self.analyze_server_disclosure(headers)
-        self.analyze_html(body)
+        # 5. Header analysis phase check
+        if self.permission.is_action_allowed(ResearchAction.HEADER_ANALYSIS):
+            self.analyze_headers(headers)
+            self.analyze_server_disclosure(headers)
+        else:
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": ResearchAction.HEADER_ANALYSIS.value,
+                    "reason": "Header analysis not authorized in PermissionGrant",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
+
+        # 6. Endpoint discovery phase check
+        if self.permission.is_action_allowed(ResearchAction.ENDPOINT_DISCOVERY):
+            self.analyze_html(body)
+        else:
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": ResearchAction.ENDPOINT_DISCOVERY.value,
+                    "reason": "Endpoint discovery not authorized in PermissionGrant",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
 
         self.deduplicate()
-        self.validate_findings()
+
+        # 7. Finding validation phase check
+        if self.permission.is_action_allowed(ResearchAction.FINDING_VALIDATION):
+            self.validate_findings()
+        else:
+            self.audit.record(
+                event_type="ACTION_AUTHORIZATION_DENIED",
+                details={
+                    "action": ResearchAction.FINDING_VALIDATION.value,
+                    "reason": "Finding validation not authorized in PermissionGrant",
+                    "target": self.target,
+                },
+                status="DENIED",
+            )
 
         self._sync_evidence()
 
@@ -822,7 +1207,7 @@ class SecurityResearchAgent:
 def save_report(result, output_dir="security_reports"):
     """
     Saves JSON evidence bundle and Markdown security report with full
-    endpoint inventory, audit trail, and validation details.
+    endpoint inventory, audit trail, authorized actions, and validation details.
     """
     Path(output_dir).mkdir(exist_ok=True)
 
@@ -837,7 +1222,9 @@ def save_report(result, output_dir="security_reports"):
     auth_verified = evidence.get("authorization_verified", False)
     sha256 = evidence.get("sha256_digest", "")
     program_id = evidence.get("program", {}).get("program_id", "N/A")
-    permission_stat = evidence.get("permission", {}).get("status", "N/A")
+    permission_dict = evidence.get("permission", {})
+    permission_stat = permission_dict.get("status", "N/A")
+    allowed_actions = permission_dict.get("allowed_actions")
 
     audit_trail = evidence.get("audit_trail", [])
     if isinstance(audit_trail, list):
@@ -862,6 +1249,10 @@ def save_report(result, output_dir="security_reports"):
         f"Scope verified: `{scope_verified}`",
         f"Authorization Status: `{permission_stat}` (Verified: `{auth_verified}`)",
     ]
+
+    if allowed_actions is not None:
+        actions_str = ", ".join(allowed_actions) if allowed_actions else "None"
+        lines.append(f"Authorized Actions: `{actions_str}`")
 
     if sha256:
         lines.append(f"Response SHA-256: `{sha256}`")

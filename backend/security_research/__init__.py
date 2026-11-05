@@ -11,6 +11,10 @@ from .agent import (
     EvidenceBundle,
     AuditEvent,
     AuditTrail,
+    ResearchAction,
+    ScopeTarget,
+    ScopeDecision,
+    ScopeReason,
 )
 from .validator import (
     FindingValidator,
@@ -36,4 +40,8 @@ __all__ = [
     "EvidenceBundle",
     "AuditEvent",
     "AuditTrail",
+    "ResearchAction",
+    "ScopeTarget",
+    "ScopeDecision",
+    "ScopeReason",
 ]
