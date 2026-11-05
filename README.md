@@ -1,4 +1,4 @@
-﻿# DARK-EYE
+# DARK-EYE
 
 ## Professional AI Cybersecurity Assistant
 
